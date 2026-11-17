@@ -949,16 +949,10 @@
         const b = state.battle;
 
         const lead = [
-            ...(
-                r?.theme
-                    ? [`Theme: ${clean(r.theme)}`]
-                    : []
-            ),
-
-            `${guildName(b.clan)}: ${num(r.points)} | ` +
-            `${guildName(b.enemyClan)}: ` +
-            num(r.enemyPoints)
-        ];
+    `${guildName(b.clan)}: ${num(r.points)} | ` +
+    `${guildName(b.enemyClan)}: ` +
+    num(r.enemyPoints)
+];
 
         const tail = [
             mvp(
