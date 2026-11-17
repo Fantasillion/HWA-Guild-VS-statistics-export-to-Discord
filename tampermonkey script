@@ -1,0 +1,1767 @@
+
+ // ==UserScript==
+ // @name         HWA - Guild VS Weekly Reporter
+ // @namespace    fantasillion.hwa.guildvs
+ // @version      1.2.0
+ // @description  Six-day Guild VS scores, rosters, MVPs and Discord reports.
+ // @match        https://www.hero-wars-alliance.com/*
+ // @match        https://hero-wars-alliance.com/*
+ // @run-at       document-start
+ // @grant        unsafeWindow
+ // @grant        GM_getValue
+ // @grant        GM_setValue
+ // @grant        GM_setClipboard
+ // @grant        GM_xmlhttpRequest
+ // @connect      discord.com
+ // ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const page = typeof unsafeWindow === 'undefined'
+        ? window : unsafeWindow;
+
+    const INSTANCE = '__HWA_GUILD_VS_REPORTER_V120__';
+    if (page[INSTANCE]) return;
+    page[INSTANCE] = true;
+
+    const DATA_KEY = 'hwaGuildVsReporterDataV1';
+    const WEBHOOK_KEY = 'hwaGuildVsReporterWebhookV1';
+    const WARNING = '⏳ In progress — scores may change';
+
+    const DAYS = [
+        'Monday', 'Tuesday', 'Wednesday',
+        'Thursday', 'Friday', 'Saturday'
+    ];
+
+    const logger = (...args) =>
+        console.info('[Guild VS]', ...args);
+
+    function blankState() {
+        return {
+            key: null,
+            battle: null,
+            ranks: null,
+            ranksKey: null,
+            roster: null,
+            rostersByGuild: {},
+            names: {},
+            battleAt: 0,
+            ranksAt: 0
+        };
+    }
+
+    function loadState() {
+        try {
+            const saved = GM_getValue(DATA_KEY, '');
+            if (!saved) return blankState();
+
+            const parsed = typeof saved === 'string'
+                ? JSON.parse(saved)
+                : saved;
+
+            if (!parsed || typeof parsed !== 'object') {
+                return blankState();
+            }
+
+            const merged = { ...blankState(), ...parsed };
+            merged.names = parsed.names || {};
+            merged.rostersByGuild = parsed.rostersByGuild || {};
+
+            // Preserve the own-guild roster stored by v1.0.
+            if (
+                merged.roster?.id &&
+                merged.roster?.members?.length
+            ) {
+                const id = String(merged.roster.id);
+
+                if (!merged.rostersByGuild[id]) {
+                    merged.rostersByGuild[id] = merged.roster;
+                }
+            }
+
+            return merged;
+        } catch (error) {
+            console.warn(
+                '[Guild VS] Could not load stored data',
+                error
+            );
+            return blankState();
+        }
+    }
+
+    const state = loadState();
+    let webhook = GM_getValue(WEBHOOK_KEY, '');
+    let pendingRanks = null;
+
+    let panel = null;
+    let preview = null;
+    let indicators = null;
+    let feedback = null;
+    let copyButton = null;
+    let sendButton = null;
+    let sending = false;
+
+    function save() {
+        try {
+            GM_setValue(DATA_KEY, JSON.stringify(state));
+        } catch (error) {
+            console.warn('[Guild VS] Save failed', error);
+        }
+    }
+
+    function update() {
+        save();
+        render();
+    }
+
+    function same(a, b) {
+        return a != null &&
+            b != null &&
+            String(a) === String(b);
+    }
+
+    function clean(value, max = 100) {
+        return String(value ?? '')
+            .replace(/[\r\n\t`]/g, ' ')
+            .replace(/@/g, '@\u200b')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, max);
+    }
+
+    function num(value) {
+        const n = Number(value);
+        return Number.isFinite(n)
+            ? n.toLocaleString('en-US')
+            : '—';
+    }
+
+    function nameFor(id) {
+        return id == null
+            ? 'Not available'
+            : state.names[String(id)] || `ID ${id}`;
+    }
+
+    function rememberName(id, name) {
+        if (id == null || typeof name !== 'string') {
+            return false;
+        }
+
+        const value = clean(name);
+        const key = String(id);
+
+        if (!value || state.names[key] === value) {
+            return false;
+        }
+
+        state.names[key] = value;
+        return true;
+    }
+
+    // --------------------------------------------------------
+    // PLAYER NAME CAPTURE
+    // --------------------------------------------------------
+
+    function captureUsers(response) {
+        const users = response?.users;
+
+        if (!users || typeof users !== 'object') {
+            return;
+        }
+
+        let changed = false;
+
+        const entries = Array.isArray(users)
+            ? users
+            : Object.values(users);
+
+        for (const user of entries) {
+            if (rememberName(user?.id, user?.name)) {
+                changed = true;
+            }
+        }
+
+        if (changed) update();
+    }
+
+    // --------------------------------------------------------
+    // GUILD ROSTER CAPTURE
+    // Supports separate own and opponent guild rosters.
+    // --------------------------------------------------------
+
+    function captureRoster(response) {
+        const clan =
+            response?.clanData?.clan ||
+            response?.clan;
+
+        if (
+            !clan?.id ||
+            !clan?.members ||
+            typeof clan.members !== 'object'
+        ) {
+            return;
+        }
+
+        const members = [];
+
+        for (
+            const [key, entry] of
+            Object.entries(clan.members)
+        ) {
+            if (!entry || typeof entry !== 'object') {
+                continue;
+            }
+
+            const id = entry.id ?? key;
+            const name = entry.name;
+
+            if (
+                id == null ||
+                typeof name !== 'string' ||
+                !name.trim()
+            ) {
+                continue;
+            }
+
+            rememberName(id, name);
+
+            members.push({
+                id: String(id),
+                name: clean(name)
+            });
+        }
+
+        if (!members.length) return;
+
+        const expectedNumber = Number(clan.membersCount);
+
+        const expected =
+            Number.isInteger(expectedNumber) &&
+            expectedNumber > 0
+                ? expectedNumber
+                : null;
+
+        const unique =
+            new Set(members.map(m => m.id)).size ===
+            members.length;
+
+        const roster = {
+            id: String(clan.id),
+            members,
+            expected,
+            complete:
+                unique &&
+                expected != null &&
+                members.length === expected
+        };
+
+        state.rostersByGuild[roster.id] = roster;
+
+        if (
+            !state.battle ||
+            same(roster.id, state.battle.clan.id)
+        ) {
+            state.roster = roster;
+        }
+
+        logger(
+            'Guild roster captured:',
+            roster.id,
+            members.length,
+            'members'
+        );
+
+        update();
+    }
+
+    // --------------------------------------------------------
+    // GUILD VS RANKINGS
+    // --------------------------------------------------------
+
+    function normalizeRanks(response) {
+        if (
+            !response?.roundRanks &&
+            !Array.isArray(response?.battleRanks)
+        ) {
+            return null;
+        }
+
+        const convert = list =>
+            Array.isArray(list)
+                ? list
+                    .filter(item =>
+                        item?.userInfo?.userId != null &&
+                        Number.isFinite(Number(item.points))
+                    )
+                    .map(item => ({
+                        id: String(item.userInfo.userId),
+                        rank: Number(item.rank) || null,
+                        points: Number(item.points)
+                    }))
+                : [];
+
+        const roundRanks = {};
+
+        for (let day = 1; day <= 6; day++) {
+            roundRanks[String(day)] = convert(
+                response.roundRanks?.[String(day)]
+            );
+        }
+
+        return {
+            roundRanks,
+            battleRanks: convert(response.battleRanks)
+        };
+    }
+
+    function captureRanks(response) {
+        const ranks = normalizeRanks(response);
+        if (!ranks) return;
+
+        pendingRanks = {
+            ranks,
+            time: Date.now()
+        };
+
+        if (state.battle && state.key) {
+            state.ranks = ranks;
+            state.ranksKey = state.key;
+            state.ranksAt = pendingRanks.time;
+
+            logger('Individual rankings captured');
+            update();
+        }
+    }
+
+    // --------------------------------------------------------
+    // GUILD VS BATTLE
+    // --------------------------------------------------------
+
+    function captureBattle(response) {
+        if (
+            !response?.clan?.id ||
+            !response?.enemyClan?.id ||
+            !Array.isArray(response.rounds)
+        ) {
+            return;
+        }
+
+        const key = [
+            response.clan.id,
+            response.enemyClan.id,
+            response.remainingTime
+        ].join(':');
+
+        const changed = state.key !== key;
+
+        if (changed) {
+            state.ranks = null;
+            state.ranksKey = null;
+            state.ranksAt = 0;
+        }
+
+        state.key = key;
+        state.battle = response;
+        state.battleAt = Date.now();
+
+        const own = state.rostersByGuild[
+            String(response.clan.id)
+        ];
+
+        if (own) {
+            state.roster = own;
+        }
+
+        if (
+            pendingRanks &&
+            Date.now() - pendingRanks.time < 120000 &&
+            (changed || !state.ranks)
+        ) {
+            state.ranks = pendingRanks.ranks;
+            state.ranksKey = key;
+            state.ranksAt = pendingRanks.time;
+        }
+
+        logger('Guild VS battle captured');
+        update();
+    }
+
+    // --------------------------------------------------------
+    // PASSIVE RPC OBSERVERS
+    // Uses the response-based interception that worked.
+    // --------------------------------------------------------
+
+    function isRpc(url) {
+        try {
+            const u = new URL(
+                String(url),
+                location.href
+            );
+
+            return (
+                u.hostname ===
+                    'api.hero-wars-alliance.com' &&
+                u.pathname === '/api/rpc'
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function ingest(data) {
+        if (!Array.isArray(data?.results)) return;
+
+        for (const entry of data.results) {
+            if (
+                entry?.error ||
+                entry?.result?.error
+            ) {
+                continue;
+            }
+
+            const response =
+                entry?.result?.response ??
+                entry?.response ??
+                entry?.result;
+
+            if (
+                !response ||
+                typeof response !== 'object'
+            ) {
+                continue;
+            }
+
+            try {
+                if (
+                    response.clan?.id != null &&
+                    response.enemyClan?.id != null &&
+                    Array.isArray(response.rounds)
+                ) {
+                    captureBattle(response);
+
+                } else if (
+                    response.roundRanks ||
+                    Array.isArray(response.battleRanks)
+                ) {
+                    captureRanks(response);
+
+                } else if (
+                    response.clanData?.clan?.members ||
+                    response.clan?.members
+                ) {
+                    captureRoster(response);
+
+                } else if (response.users) {
+                    captureUsers(response);
+                }
+
+            } catch (error) {
+                console.error(
+                    '[Guild VS] Response processing error',
+                    error
+                );
+            }
+        }
+    }
+
+    // --------------------------------------------------------
+    // FETCH OBSERVER
+    // --------------------------------------------------------
+
+    let lastFetchWrapper = null;
+
+    function ensureFetchObserver() {
+        const original = page.fetch;
+
+        if (
+            typeof original !== 'function' ||
+            original === lastFetchWrapper
+        ) {
+            return;
+        }
+
+        function wrappedFetch(...args) {
+            const input = args[0];
+
+            const observe = isRpc(
+                input?.url || input
+            );
+
+            const result = Reflect.apply(
+                original,
+                this,
+                args
+            );
+
+            if (observe) {
+                Promise.resolve(result)
+                    .then(response => {
+                        if (!response?.ok) return;
+
+                        response.clone().json()
+                            .then(ingest)
+                            .catch(error => {
+                                console.warn(
+                                    '[Guild VS] Fetch JSON error',
+                                    error
+                                );
+                            });
+                    })
+                    .catch(() => {});
+            }
+
+            return result;
+        }
+
+        lastFetchWrapper = wrappedFetch;
+        page.fetch = wrappedFetch;
+
+        logger('Fetch observer installed');
+    }
+
+    // --------------------------------------------------------
+    // XHR OBSERVER
+    // --------------------------------------------------------
+
+    function installXhrObserver() {
+        const proto =
+            page.XMLHttpRequest?.prototype;
+
+        if (!proto) return;
+
+        const originalOpen = proto.open;
+        const originalSend = proto.send;
+
+        const metadata = new WeakMap();
+
+        proto.open = function (
+            method,
+            url,
+            ...rest
+        ) {
+            metadata.set(this, isRpc(url));
+
+            return Reflect.apply(
+                originalOpen,
+                this,
+                [method, url, ...rest]
+            );
+        };
+
+        proto.send = function (...args) {
+            if (metadata.get(this)) {
+                this.addEventListener(
+                    'load',
+                    () => {
+                        try {
+                            if (
+                                this.status < 200 ||
+                                this.status >= 300
+                            ) {
+                                return;
+                            }
+
+                            const data =
+                                this.responseType === 'json'
+                                    ? this.response
+                                    : JSON.parse(
+                                        this.responseText
+                                    );
+
+                            ingest(data);
+
+                        } catch (error) {
+                            console.warn(
+                                '[Guild VS] XHR JSON error',
+                                error
+                            );
+                        }
+                    },
+                    { once: true }
+                );
+            }
+
+            return Reflect.apply(
+                originalSend,
+                this,
+                args
+            );
+        };
+
+        logger('XHR observer installed');
+    }
+
+    ensureFetchObserver();
+    installXhrObserver();
+
+    page.setInterval(
+        ensureFetchObserver,
+        3000
+    );
+
+    // --------------------------------------------------------
+    // REPORT DATA HELPERS
+    // --------------------------------------------------------
+
+    function currentRanks() {
+        return state.ranksKey === state.key
+            ? state.ranks
+            : null;
+    }
+
+    function round(day) {
+        return state.battle?.rounds?.find(
+            r => Number(r.index) === day
+        ) || null;
+    }
+
+    function status(r) {
+        if (!r) return 'PENDING';
+
+        const value = String(
+            r.status || ''
+        ).toLowerCase();
+
+        if (value === 'soon') {
+            return 'PENDING';
+        }
+
+        if (
+            value === 'inprogress' ||
+            value === 'in_progress'
+        ) {
+            return 'IN PROGRESS';
+        }
+
+        if (r.winnerClanId != null) {
+            return same(
+                r.winnerClanId,
+                state.battle?.clan?.id
+            ) ? 'WIN' : 'LOSS';
+        }
+
+        if (
+            ['win', 'won', 'victory']
+                .includes(value)
+        ) {
+            return 'WIN';
+        }
+
+        if (
+            ['loose', 'lose', 'loss',
+             'lost', 'defeat'].includes(value)
+        ) {
+            return 'LOSS';
+        }
+
+        return 'UNKNOWN';
+    }
+
+    function ownRoster() {
+        const id = state.battle?.clan?.id;
+
+        const roster = id == null
+            ? null
+            : state.rostersByGuild[String(id)];
+
+        return roster?.complete
+            ? roster.members
+            : [];
+    }
+
+    function enemyRoster() {
+        const id = state.battle?.enemyClan?.id;
+
+        return id == null
+            ? null
+            : state.rostersByGuild[String(id)] || null;
+    }
+
+    function rankingLoaded() {
+        const ranks = currentRanks();
+
+        return Boolean(
+            ranks &&
+            (
+                ranks.battleRanks?.length ||
+                Object.values(
+                    ranks.roundRanks || {}
+                ).some(rows => rows?.length)
+            )
+        );
+    }
+
+    function rowsFor(day = null) {
+        const ranks = currentRanks();
+        if (!ranks) return [];
+
+        const list = day == null
+            ? ranks.battleRanks
+            : ranks.roundRanks[String(day)];
+
+        const result = Array.isArray(list)
+            ? list.map(row => ({ ...row }))
+            : [];
+
+        if (result.length) {
+            const known = new Set(
+                result.map(row => row.id)
+            );
+
+            for (const member of ownRoster()) {
+                if (!known.has(member.id)) {
+                    result.push({
+                        id: member.id,
+                        rank: null,
+                        points: null
+                    });
+                }
+            }
+        }
+
+        return result.sort((a, b) => {
+            if (a.rank == null) return 1;
+            if (b.rank == null) return -1;
+            return a.rank - b.rank;
+        });
+    }
+
+    function playerPoints(id, day = null) {
+        const ranks = currentRanks();
+
+        if (!ranks || id == null) return null;
+
+        const list = day == null
+            ? ranks.battleRanks
+            : ranks.roundRanks[String(day)];
+
+        return list?.find(
+            row => same(row.id, id)
+        )?.points ?? null;
+    }
+
+    function guildName(clan) {
+        return clean(
+            clan?.name || 'Unknown guild',
+            48
+        );
+    }
+
+    function guildLabel(clan) {
+        return (
+            `${guildName(clan)} ` +
+            `(Server ${clean(clan?.server || '?')})`
+        );
+    }
+
+    function marker(s) {
+        if (s === 'WIN') return '✅';
+        if (s === 'LOSS') return '❌';
+        if (s === 'IN PROGRESS') return '⏳';
+        if (s === 'PENDING') return '🔒';
+        return '❔';
+    }
+
+    function mvp(label, id, day = null) {
+        if (id == null) {
+            return `${label}: Not available`;
+        }
+
+        const points = playerPoints(id, day);
+
+        return (
+            `${label}: ${nameFor(id)}` +
+            (
+                points == null
+                    ? ''
+                    : ` — ${num(points)} points`
+            )
+        );
+    }
+
+    function tableName(name, max = 22) {
+        const chars = Array.from(clean(name));
+
+        const value = chars.length > max
+            ? chars.slice(0, max - 1).join('') + '…'
+            : chars.join('');
+
+        return value.padEnd(max, ' ');
+    }
+
+    function scoreRow(item) {
+        const index = item.rank == null
+            ? '--'
+            : String(item.rank).padStart(2, ' ');
+
+        const points = item.points == null
+            ? '—'
+            : num(item.points);
+
+        return (
+            `${index}  ${tableName(nameFor(item.id))}  ` +
+            points.padStart(13, ' ')
+        );
+    }
+
+    // --------------------------------------------------------
+    // DISCORD SCORE TABLES
+    // --------------------------------------------------------
+
+    function scoreTables({
+        title,
+        lead = [],
+        rows = [],
+        tail = [],
+        live = false
+    }) {
+        const lines = rows.length
+            ? rows.map(scoreRow)
+            : ['--  No player rankings available'];
+
+        const groups = [];
+
+        for (
+            let i = 0;
+            i < lines.length;
+            i += 23
+        ) {
+            groups.push(
+                lines.slice(i, i + 23)
+            );
+        }
+
+        return groups.map((group, i) => {
+            const first = i === 0;
+            const last = i === groups.length - 1;
+
+            const label = groups.length > 1
+                ? ` (${i + 1}/${groups.length})`
+                : '';
+
+            const message = [
+                `**${title}${label}**`
+            ];
+
+            if (first && live) {
+                message.push(WARNING);
+            }
+
+            if (first) {
+                message.push(...lead);
+            }
+
+            message.push(
+                '```text',
+                ' #  Player                         Points',
+                '--------------------------------------------',
+                ...group,
+                '```'
+            );
+
+            if (last) {
+                message.push(...tail);
+            }
+
+            if (last && live) {
+                message.push(WARNING);
+            }
+
+            const text = message.join('\n');
+
+            if (text.length > 2000) {
+                throw new Error(
+                    'A Discord score table exceeds 2000 characters.'
+                );
+            }
+
+            return text;
+        });
+    }
+
+    // --------------------------------------------------------
+    // WEEKLY OVERVIEW
+    // All days appear here, including pending days.
+    // --------------------------------------------------------
+
+    function makeOverview() {
+        const b = state.battle;
+
+        const lines = [
+            '**⚔️ GUILD VS — WEEKLY REPORT**',
+            `**${guildLabel(b.clan)} vs ` +
+                `${guildLabel(b.enemyClan)}**`,
+            `League: ${clean(b.league)}`,
+            '',
+            '**Weekly Victory Points (completed days)**',
+            `${num(b.clanBattleScore)} — ` +
+                num(b.enemyClanBattleScore),
+            '',
+            '**Accumulated guild points**',
+            `${guildName(b.clan)}: ` +
+                num(b.clanBattleTotalPoints),
+            `${guildName(b.enemyClan)}: ` +
+                num(b.enemyClanBattleTotalPoints),
+            '',
+            '**Daily results**'
+        ];
+
+        for (let day = 1; day <= 6; day++) {
+            const r = round(day);
+            const s = status(r);
+
+            const totals = s === 'PENDING'
+                ? ''
+                : (
+                    ` | ${num(r.points)} vs ` +
+                    num(r.enemyPoints)
+                );
+
+            lines.push(
+                `${marker(s)} Day ${day} ` +
+                `(${DAYS[day - 1]}): ${s}${totals}`
+            );
+        }
+
+        lines.push(
+            '',
+            'Pending days have no separate tables. ' +
+            'Live-day scores are provisional.'
+        );
+
+        return lines.join('\n');
+    }
+
+    // --------------------------------------------------------
+    // INDIVIDUAL DAY REPORTS
+    // Pending days are intentionally skipped.
+    // --------------------------------------------------------
+
+    function makeDay(day) {
+        const r = round(day);
+        const s = status(r);
+
+        if (s === 'PENDING') {
+            return [];
+        }
+
+        const b = state.battle;
+
+        const lead = [
+            ...(
+                r?.theme
+                    ? [`Theme: ${clean(r.theme)}`]
+                    : []
+            ),
+
+            `${guildName(b.clan)}: ${num(r.points)} | ` +
+            `${guildName(b.enemyClan)}: ` +
+            num(r.enemyPoints)
+        ];
+
+        const tail = [
+            mvp(
+                '🏆 Our MVP',
+                r?.bestPlayerId,
+                day
+            ),
+            mvp(
+                '🏆 Opponent MVP',
+                r?.enemyBestPlayerId
+            )
+        ];
+
+        if (!rankingLoaded()) {
+            tail.push(
+                '⚠️ Player rankings not captured. ' +
+                'Open Guild VS rankings.'
+            );
+        } else {
+            const raw = currentRanks()
+                ?.roundRanks?.[String(day)];
+
+            if (raw?.length) {
+                const sum = raw.reduce(
+                    (total, row) =>
+                        total + row.points,
+                    0
+                );
+
+                if (
+                    r.points != null &&
+                    sum !== Number(r.points)
+                ) {
+                    tail.push(
+                        'ℹ️ Guild totals and rankings were ' +
+                        'captured at different moments.'
+                    );
+                }
+            }
+        }
+
+        return scoreTables({
+            title:
+                `${marker(s)} DAY ${day} — ` +
+                `${DAYS[day - 1]} — ${s}`,
+            lead,
+            rows: rowsFor(day),
+            tail,
+            live: s === 'IN PROGRESS'
+        });
+    }
+
+    // --------------------------------------------------------
+    // WEEKLY PLAYER TOTALS
+    // --------------------------------------------------------
+
+    function makeWeeklyTotals() {
+        const b = state.battle;
+
+        const tail = [
+            mvp(
+                '🏆 Our weekly MVP',
+                b.bestPlayer?.userId
+            ),
+            mvp(
+                '🏆 Opponent weekly MVP',
+                b.bestEnemyPlayer?.userId
+            )
+        ];
+
+        const rankList =
+            currentRanks()?.battleRanks || [];
+
+        if (rankList.length) {
+            const sum = rankList.reduce(
+                (total, p) =>
+                    total + p.points,
+                0
+            );
+
+            if (
+                sum !== Number(
+                    b.clanBattleTotalPoints
+                )
+            ) {
+                tail.push(
+                    'ℹ️ Weekly ranking and guild total ' +
+                    'were captured at different moments.'
+                );
+            }
+        }
+
+        tail.push(
+            '— means the player was not listed ' +
+            'in the captured rankings.'
+        );
+
+        return scoreTables({
+            title: '📊 WEEKLY PLAYER TOTALS',
+
+            lead: [
+                `Guild: ${guildLabel(b.clan)}`,
+                `Our total: ` +
+                    num(b.clanBattleTotalPoints),
+                `Opponent total: ` +
+                    num(b.enemyClanBattleTotalPoints)
+            ],
+
+            rows: rowsFor(),
+            tail
+        });
+    }
+
+    // --------------------------------------------------------
+    // OPPOSING GUILD ROSTER
+    // --------------------------------------------------------
+
+    function makeOpponentRoster() {
+        const opponent = state.battle.enemyClan;
+        const roster = enemyRoster();
+
+        const heading =
+            '👥 OPPOSING GUILD ROSTER — ' +
+            guildLabel(opponent);
+
+        if (!roster?.members?.length) {
+            return [
+                `**${heading}**\n` +
+                '⚠️ Opponent roster not captured. ' +
+                'Open the opposing guild member list ' +
+                'in the game. The current Guild VS ' +
+                'battle response does not contain ' +
+                'its membership.'
+            ];
+        }
+
+        const members = [...roster.members].sort(
+            (a, b) =>
+                a.name.localeCompare(b.name)
+        );
+
+        const groups = [];
+
+        for (
+            let i = 0;
+            i < members.length;
+            i += 20
+        ) {
+            groups.push(
+                members.slice(i, i + 20)
+            );
+        }
+
+        return groups.map((group, i) => {
+            const part = groups.length > 1
+                ? ` (${i + 1}/${groups.length})`
+                : '';
+
+            const count = roster.expected == null
+                ? (
+                    `${members.length} captured ` +
+                    '(total unverified)'
+                )
+                : (
+                    `${members.length}/` +
+                    `${roster.expected} captured`
+                );
+
+            const rows = group.map(
+                (member, j) =>
+                    String(
+                        i * 20 + j + 1
+                    ).padStart(2, ' ') +
+                    '  ' +
+                    clean(member.name, 65)
+            );
+
+            const message = [
+                `**${heading}${part}**`,
+                `Members: ${count}` +
+                    (roster.complete ? ' ✅' : ' ⚠️'),
+                '```text',
+                ' #  Player',
+                '--------------------------------',
+                ...rows,
+                '```'
+            ];
+
+            if (
+                i === groups.length - 1 &&
+                !roster.complete
+            ) {
+                message.push(
+                    '⚠️ Roster completeness ' +
+                    'has not been verified.'
+                );
+            }
+
+            const text = message.join('\n');
+
+            if (text.length > 2000) {
+                throw new Error(
+                    'An opponent roster table exceeds ' +
+                    '2000 characters.'
+                );
+            }
+
+            return text;
+        });
+    }
+
+    // --------------------------------------------------------
+    // COMPLETE REPORT
+    // --------------------------------------------------------
+
+    function makeMessages() {
+        if (!state.battle) return [];
+
+        const messages = [
+            makeOverview()
+        ];
+
+        for (let day = 1; day <= 6; day++) {
+            if (
+                status(round(day)) !== 'PENDING'
+            ) {
+                messages.push(
+                    ...makeDay(day)
+                );
+            }
+        }
+
+        messages.push(
+            ...makeWeeklyTotals()
+        );
+
+        messages.push(
+            ...makeOpponentRoster()
+        );
+
+        if (
+            messages.some(
+                message => message.length > 2000
+            )
+        ) {
+            throw new Error(
+                'Report message exceeds Discord ' +
+                '2000-character limit.'
+            );
+        }
+
+        return messages;
+    }
+
+    // --------------------------------------------------------
+    // DISCORD WEBHOOK
+    // --------------------------------------------------------
+
+    function validWebhook(value) {
+        try {
+            const u = new URL(value);
+
+            return (
+                u.protocol === 'https:' &&
+                u.hostname === 'discord.com' &&
+                /^\/api\/webhooks\/\d+\/[A-Za-z0-9._-]+\/?$/
+                    .test(u.pathname)
+            );
+        } catch {
+            return false;
+        }
+    }
+
+    function setFeedback(message) {
+        if (feedback) {
+            feedback.textContent = message;
+        }
+    }
+
+    function configureWebhook() {
+        const value = page.prompt(
+            'Enter the Discord webhook URL ' +
+            '(empty clears it):',
+            webhook
+        );
+
+        if (value == null) return;
+
+        const next = value.trim();
+
+        if (
+            next &&
+            !validWebhook(next)
+        ) {
+            return setFeedback(
+                'Invalid Discord webhook URL.'
+            );
+        }
+
+        webhook = next;
+
+        GM_setValue(
+            WEBHOOK_KEY,
+            webhook
+        );
+
+        setFeedback(
+            webhook
+                ? 'Webhook URL saved.'
+                : 'Webhook URL cleared.'
+        );
+    }
+
+    function copyReport() {
+        if (!state.battle) {
+            return setFeedback(
+                'Open Guild VS first.'
+            );
+        }
+
+        try {
+            GM_setClipboard(
+                makeMessages().join('\n\n'),
+                'text'
+            );
+
+            setFeedback(
+                'Report copied to clipboard.'
+            );
+        } catch (error) {
+            setFeedback(error.message);
+        }
+    }
+
+    function postOne(content) {
+        return new Promise(
+            (resolve, reject) => {
+                const url = new URL(webhook);
+                url.searchParams.set(
+                    'wait',
+                    'true'
+                );
+
+                GM_xmlhttpRequest({
+                    method: 'POST',
+                    url: url.href,
+
+                    headers: {
+                        'Content-Type':
+                            'application/json'
+                    },
+
+                    data: JSON.stringify({
+                        content,
+                        allowed_mentions: {
+                            parse: []
+                        }
+                    }),
+
+                    timeout: 30000,
+
+                    onload: resolve,
+
+                    onerror: () =>
+                        reject(
+                            new Error(
+                                'Discord network error.'
+                            )
+                        ),
+
+                    ontimeout: () =>
+                        reject(
+                            new Error(
+                                'Timed out; check Discord ' +
+                                'before retrying.'
+                            )
+                        )
+                });
+            }
+        );
+    }
+
+    const delay = ms =>
+        new Promise(resolve =>
+            page.setTimeout(resolve, ms)
+        );
+
+    async function postWithRetry(message) {
+        for (
+            let attempt = 0;
+            attempt < 4;
+            attempt++
+        ) {
+            const reply = await postOne(message);
+
+            if (
+                reply.status >= 200 &&
+                reply.status < 300
+            ) {
+                return;
+            }
+
+            if (
+                reply.status === 429 &&
+                attempt < 3
+            ) {
+                let seconds = 2;
+
+                try {
+                    seconds = Number(
+                        JSON.parse(
+                            reply.responseText
+                        ).retry_after
+                    ) || 2;
+                } catch {
+                    // Keep fallback delay.
+                }
+
+                await delay(
+                    Math.min(
+                        60000,
+                        Math.max(
+                            1000,
+                            seconds * 1000
+                        )
+                    )
+                );
+
+                continue;
+            }
+
+            throw new Error(
+                `Discord HTTP ${reply.status}.`
+            );
+        }
+    }
+
+    async function sendReport() {
+        if (sending) return;
+
+        if (!state.battle) {
+            return setFeedback(
+                'Open Guild VS first.'
+            );
+        }
+
+        if (!webhook) {
+            configureWebhook();
+
+            if (!webhook) return;
+        }
+
+        if (!validWebhook(webhook)) {
+            return setFeedback(
+                'Invalid webhook URL.'
+            );
+        }
+
+        let messages;
+
+        try {
+            messages = makeMessages();
+        } catch (error) {
+            return setFeedback(
+                error.message
+            );
+        }
+
+        sending = true;
+        render();
+
+        let sent = 0;
+
+        try {
+            for (const message of messages) {
+                setFeedback(
+                    `Sending ${sent + 1}/` +
+                    `${messages.length}...`
+                );
+
+                await postWithRetry(message);
+                sent++;
+            }
+
+            setFeedback(
+                `✅ Posted ${sent} ` +
+                'Guild VS messages.'
+            );
+
+        } catch (error) {
+            setFeedback(
+                `${sent}/${messages.length} ` +
+                'messages sent. ' +
+                error.message
+            );
+        } finally {
+            sending = false;
+            render();
+        }
+    }
+
+    // --------------------------------------------------------
+    // THREE INDIVIDUAL LOADING INDICATORS
+    // --------------------------------------------------------
+
+    function loadingStatus() {
+        const battle = state.battle;
+        const ranks = rankingLoaded();
+        const enemy = enemyRoster();
+
+        let enemyStatus =
+            '⏳ Opponent guild roster: not loaded';
+
+        if (enemy?.members?.length) {
+            const total = enemy.expected == null
+                ? (
+                    `${enemy.members.length} captured`
+                )
+                : (
+                    `${enemy.members.length}/` +
+                    `${enemy.expected}`
+                );
+
+            enemyStatus =
+                `${enemy.complete ? '✅' : '⚠️'} ` +
+                `Opponent guild roster: ${total}`;
+        }
+
+        return [
+            `${battle ? '✅' : '⏳'} Guild VS: ` +
+                (battle ? 'loaded' : 'waiting'),
+
+            `${ranks ? '✅' : '⏳'} ` +
+                'Individual rankings: ' +
+                (ranks ? 'loaded' : 'waiting'),
+
+            enemyStatus
+        ].join('\n');
+    }
+
+    // --------------------------------------------------------
+    // PANEL RENDERING
+    // --------------------------------------------------------
+
+    function render() {
+        if (!panel || !preview) return;
+
+        indicators.textContent =
+            loadingStatus();
+
+        if (!state.battle) {
+            preview.value =
+                'Waiting for Guild VS data.\n\n' +
+                'Open Guild VS and individual ' +
+                'player rankings.';
+
+            copyButton.disabled = true;
+            sendButton.disabled = true;
+
+            return;
+        }
+
+        try {
+            preview.value =
+                makeMessages().join('\n\n');
+
+            copyButton.disabled = sending;
+            sendButton.disabled = sending;
+
+        } catch (error) {
+            preview.value =
+                'Report formatting error:\n' +
+                error.message;
+
+            copyButton.disabled = true;
+            sendButton.disabled = true;
+        }
+    }
+
+    // --------------------------------------------------------
+    // FLOATING PANEL
+    // --------------------------------------------------------
+
+    function mount() {
+        const doc = page.document;
+
+        if (
+            !doc?.body ||
+            (panel && panel.isConnected)
+        ) {
+            return;
+        }
+
+        panel = doc.createElement('div');
+        panel.id = 'hwa-guild-vs-reporter';
+
+        panel.style.cssText =
+            'position:fixed;top:72px;right:18px;' +
+            'z-index:2147483647;width:510px;' +
+            'max-width:94vw;max-height:82vh;' +
+            'box-sizing:border-box;padding:14px;' +
+            'background:#18212e;' +
+            'border:1px solid #536579;' +
+            'border-radius:10px;color:#f3f6fa;' +
+            'box-shadow:0 12px 36px #0008;' +
+            'font:13px Arial,sans-serif;' +
+            'display:flex;flex-direction:column;' +
+            'gap:9px;';
+
+        const header = doc.createElement('div');
+
+        header.style.cssText =
+            'display:flex;' +
+            'justify-content:space-between;' +
+            'align-items:center;gap:8px;';
+
+        const title = doc.createElement('strong');
+        title.textContent =
+            '⚔️ Guild VS Weekly Reporter v1.2';
+
+        title.style.fontSize = '16px';
+
+        const minimize = doc.createElement('button');
+        minimize.textContent = '−';
+        minimize.title = 'Minimize / expand';
+
+        minimize.style.cssText =
+            'cursor:pointer;font-size:20px;' +
+            'width:30px;height:28px;';
+
+        header.append(
+            title,
+            minimize
+        );
+
+        const body = doc.createElement('div');
+
+        body.style.cssText =
+            'display:flex;flex-direction:column;' +
+            'gap:10px;min-height:0;';
+
+        indicators = doc.createElement('div');
+
+        indicators.style.cssText =
+            'white-space:pre-line;' +
+            'line-height:1.6;' +
+            'color:#b8d5f0;' +
+            'font-size:12px;';
+
+        preview = doc.createElement('textarea');
+        preview.readOnly = true;
+        preview.spellcheck = false;
+
+        preview.style.cssText =
+            'width:100%;height:340px;' +
+            'min-height:130px;max-height:55vh;' +
+            'box-sizing:border-box;' +
+            'resize:vertical;overflow:auto;' +
+            'background:#0b111a;color:#e7f0ff;' +
+            'border:1px solid #405168;' +
+            'border-radius:6px;padding:9px;' +
+            'font:11px/1.45 Consolas,monospace;' +
+            'white-space:pre;';
+
+        const buttons = doc.createElement('div');
+
+        buttons.style.cssText =
+            'display:flex;gap:7px;flex-wrap:wrap;';
+
+        function button(text, action) {
+            const el = doc.createElement('button');
+
+            el.type = 'button';
+            el.textContent = text;
+
+            el.style.cssText =
+                'flex:1;min-width:110px;' +
+                'padding:9px 6px;cursor:pointer;' +
+                'color:white;background:#34577c;' +
+                'border:1px solid #7095b9;' +
+                'border-radius:5px;' +
+                'font:bold 12px Arial,sans-serif;';
+
+            el.addEventListener(
+                'click',
+                action
+            );
+
+            buttons.appendChild(el);
+            return el;
+        }
+
+        copyButton = button(
+            '📋 Copy Report',
+            copyReport
+        );
+
+        button(
+            '🔗 Webhook URL',
+            configureWebhook
+        );
+
+        sendButton = button(
+            '📨 Post to Discord',
+            sendReport
+        );
+
+        feedback = doc.createElement('div');
+
+        feedback.style.cssText =
+            'font-size:12px;min-height:18px;' +
+            'color:#a6dcb6;';
+
+        const help = doc.createElement('div');
+
+        help.textContent =
+            'Open Guild VS rankings, your own ' +
+            'guild members, and the opposing ' +
+            'guild member list. No new game ' +
+            'API requests are sent.';
+
+        help.style.cssText =
+            'font-size:11px;line-height:1.4;' +
+            'color:#aebdce;';
+
+        body.append(
+            indicators,
+            preview,
+            buttons,
+            feedback,
+            help
+        );
+
+        panel.append(
+            header,
+            body
+        );
+
+        doc.body.appendChild(panel);
+
+        let collapsed = false;
+
+        minimize.addEventListener(
+            'click',
+            () => {
+                collapsed = !collapsed;
+
+                body.style.display =
+                    collapsed ? 'none' : 'flex';
+
+                minimize.textContent =
+                    collapsed ? '+' : '−';
+            }
+        );
+
+        render();
+        logger('Floating panel mounted');
+    }
+
+    // --------------------------------------------------------
+    // AUTOMATIC PANEL RECOVERY
+    // --------------------------------------------------------
+
+    function ensurePanel() {
+        try {
+            if (
+                panel &&
+                panel.isConnected
+            ) {
+                return;
+            }
+
+            panel = null;
+            mount();
+
+        } catch (error) {
+            console.error(
+                '[Guild VS] Panel error',
+                error
+            );
+        }
+    }
+
+    page.document.addEventListener(
+        'DOMContentLoaded',
+        ensurePanel,
+        { once: true }
+    );
+
+    page.addEventListener(
+        'load',
+        ensurePanel,
+        { once: true }
+    );
+
+    page.setInterval(
+        ensurePanel,
+        3000
+    );
+
+    ensurePanel();
+
+    logger(
+        'Weekly Reporter v1.2 initialized'
+    );
+})();
