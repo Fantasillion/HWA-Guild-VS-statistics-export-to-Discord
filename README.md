@@ -3,6 +3,9 @@
 # HWA-Guild-VS-statistics-export-to-Discord
 
 
+<img width="455" height="523" alt="image" src="https://github.com/user-attachments/assets/7e18d38e-b597-4cbd-b4f7-2c6662132fee" />
+
+
 **⚔️ GUILD VS — WEEKLY REPORT**
 **<Your Guild> (Server Number) vs <Opposing Guild> (Server number)**
 League: gold
